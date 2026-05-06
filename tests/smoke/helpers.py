@@ -1,0 +1,186 @@
+"""Smoke-test specific helpers.
+
+These helpers complement the shared integration-test helpers in
+``tests.integration.conftest``. They cover situations specific to the
+notebook-style smoke scenarios:
+
+- Polling vector visibility after upsert (freshness window).
+- Defeating the pod-index "Ready-but-not-ready" race.
+- Locating the sample files reused from ``tests/integration/``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pinecone.async_client.async_index import AsyncIndex
+    from pinecone.grpc import GrpcIndex
+    from pinecone.index import Index
+    from pinecone.models.namespaces.models import NamespaceDescription
+
+
+# ---------------------------------------------------------------------------
+# Sample files (reused from tests/integration/)
+# ---------------------------------------------------------------------------
+
+_INTEGRATION_DIR = Path(__file__).resolve().parent.parent / "integration"
+SAMPLE_TEXT_FILE: Path = _INTEGRATION_DIR / "tiny_file.txt"
+SAMPLE_PDF_SMALL: Path = _INTEGRATION_DIR / "tiny_file.pdf"
+
+
+# ---------------------------------------------------------------------------
+# Vector freshness polling
+# ---------------------------------------------------------------------------
+
+
+def wait_for_vector_count(
+    idx: Index | GrpcIndex,
+    namespace: str,
+    expected: int,
+    *,
+    timeout: int = 60,
+    interval: int = 2,
+) -> None:
+    """Poll ``describe_index_stats`` until the namespace contains ``expected`` vectors.
+
+    User spec: vectors are typically queryable in <10s, occasionally up to ~60s.
+    Anything longer is treated as a bug.
+    """
+    start = time.monotonic()
+    last_count = -1
+    while time.monotonic() - start < timeout:
+        try:
+            stats = idx.describe_index_stats()
+            ns_stats = stats.namespaces.get(namespace) if stats.namespaces else None
+            last_count = ns_stats.vector_count if ns_stats else 0
+            if last_count >= expected:
+                return
+        except Exception as exc:
+            print(f"  describe_index_stats failed during freshness wait: {exc}")
+        time.sleep(interval)
+    raise TimeoutError(
+        f"Namespace {namespace!r} only contained {last_count} vectors after "
+        f"{timeout}s (expected ≥{expected})"
+    )
+
+
+async def async_wait_for_vector_count(
+    idx: AsyncIndex,
+    namespace: str,
+    expected: int,
+    *,
+    timeout: int = 60,
+    interval: int = 2,
+) -> None:
+    """Async version of :func:`wait_for_vector_count`."""
+    start = time.monotonic()
+    last_count = -1
+    while time.monotonic() - start < timeout:
+        try:
+            stats = await idx.describe_index_stats()
+            ns_stats = stats.namespaces.get(namespace) if stats.namespaces else None
+            last_count = ns_stats.vector_count if ns_stats else 0
+            if last_count >= expected:
+                return
+        except Exception as exc:
+            print(f"  describe_index_stats failed during freshness wait: {exc}")
+        await asyncio.sleep(interval)
+    raise TimeoutError(
+        f"Namespace {namespace!r} only contained {last_count} vectors after "
+        f"{timeout}s (expected ≥{expected})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Namespace visibility polling
+# ---------------------------------------------------------------------------
+#
+# create_namespace returns synchronously, but describe/list calls against the
+# new namespace can briefly return 404 while the metadata propagates to the
+# read path. These helpers retry describe_namespace until it succeeds or a
+# bounded timeout expires — never block the suite indefinitely.
+
+
+def wait_for_namespace_visible(
+    idx: Index,
+    name: str,
+    *,
+    timeout: int = 30,
+    interval: int = 1,
+) -> NamespaceDescription:
+    """Poll ``describe_namespace`` until it returns successfully.
+
+    Returns the ``NamespaceDescription`` from the first successful call. Raises
+    :class:`TimeoutError` if the namespace is not visible within ``timeout``.
+    """
+    start = time.monotonic()
+    last_exc: Exception | None = None
+    while time.monotonic() - start < timeout:
+        try:
+            return idx.describe_namespace(name=name)
+        except Exception as exc:
+            last_exc = exc
+        time.sleep(interval)
+    raise TimeoutError(
+        f"Namespace {name!r} not visible to describe_namespace within "
+        f"{timeout}s (last error: {last_exc!r})"
+    )
+
+
+async def async_wait_for_namespace_visible(
+    idx: AsyncIndex,
+    name: str,
+    *,
+    timeout: int = 30,
+    interval: int = 1,
+) -> NamespaceDescription:
+    """Async version of :func:`wait_for_namespace_visible`."""
+    start = time.monotonic()
+    last_exc: Exception | None = None
+    while time.monotonic() - start < timeout:
+        try:
+            return await idx.describe_namespace(name=name)
+        except Exception as exc:
+            last_exc = exc
+        await asyncio.sleep(interval)
+    raise TimeoutError(
+        f"Namespace {name!r} not visible to describe_namespace within "
+        f"{timeout}s (last error: {last_exc!r})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pod-index warmup polling
+# ---------------------------------------------------------------------------
+
+
+def wait_for_pod_warmup(
+    idx: Index,
+    ping_id: str,
+    *,
+    namespace: str = "",
+    timeout: int = 120,
+    interval: int = 3,
+) -> None:
+    """Retry ``fetch`` until a pod index actually serves data after ``status=Ready``.
+
+    Pod indexes occasionally report Ready a beat before they accept traffic.
+    This helper polls a known vector ID until a fetch call succeeds without
+    raising, then returns. Used only by the pod/collections scenario.
+    """
+    start = time.monotonic()
+    last_exc: Exception | None = None
+    while time.monotonic() - start < timeout:
+        try:
+            idx.fetch(ids=[ping_id], namespace=namespace)
+            return
+        except Exception as exc:
+            last_exc = exc
+        time.sleep(interval)
+    raise TimeoutError(
+        f"Pod index did not warm up within {timeout}s (last fetch error: {last_exc!r})"
+    )

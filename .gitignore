@@ -1,0 +1,33 @@
+# Environment
+.env
+.env.local
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+
+# Rust / maturin
+target/
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+
+# Test / coverage artifacts
+.coverage
+htmlcov/
+
+# Harness artifacts (should live in the harness repo, not here)
+pipeline-state/
+tasks/
